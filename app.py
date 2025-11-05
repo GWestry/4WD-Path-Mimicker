@@ -1,44 +1,66 @@
-# app.py
+# This program runs a Freenove 4WD Smart Car
+# The Freenove motor library is imported via its specific system path.
+# Library is used to communicate clearly to the Pi and Freenove GPIO pins.
+# This path must be adjusted for any new environment/car.
+
 import cv2
 import numpy as np
-import base64
 import time
 import atexit
 import math
+import threading
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from picamera2 import Picamera2
 
-# --- GPIO cleanup function ---
+# global boolean variables
+object_detected = False
+detection_thread = None
+stop_detection = False
+
+
+# gpio cleanup
 def cleanup_gpio():
-    """Clean up GPIO resources on exit"""
+    """Stop all motors on exit"""
     try:
-        if 'car' in globals():
-            print("Cleaning up Freenove motor...")
+        if "car" in globals():
+            print("Cleaning up Freenove motor")
             car.set_motor_model(0, 0, 0, 0)
             car.close()
     except Exception as e:
-        print(f"Error during cleanup: {e}")
+        print(f"Cleanup error: {e}")
+
 
 atexit.register(cleanup_gpio)
 
-# --- Freenove library setup ---
+
+# setting up motors
 try:
     import sys
-    sys.path.append('/home/gwestry/Freenove_4WD_Smart_Car_Kit_for_Raspberry_Pi/Code/Server')
+
+    sys.path.append(
+        #this would be dependent on your file structure/path to the Freenove motor library
+        "/home/gwestry/Freenove_4WD_Smart_Car_Kit_for_Raspberry_Pi/Code/Server"
+    )
     import motor
+
     car = motor.Ordinary_Car()
-    print("Using Freenove motor library")
+    print("Freenove motor library loaded")
 except ImportError as e:
-    print(f"Freenove library not found: {e}")
+    print(f"Freenove motor library not found: {e}")
     exit(1)
 
-# --- Flask setup ---
+
+# flask setup
 app = Flask(__name__)
 CORS(app)
 
-# --- Motor movement functions ---
-def move_car(direction, duration, speed=1000):
-    print(f"Moving {direction} for {duration:.2f}s")
+
+# motor control/movement logic
+def move_car(direction, duration, speed=800):
+    """Consistent movement with short stop pause"""
+    print(f"Moving {direction} for {duration:.2f}s (speed={speed})")
+
     try:
         if direction == "forward":
             car.set_motor_model(speed, speed, speed, speed)
@@ -51,137 +73,195 @@ def move_car(direction, duration, speed=1000):
         elif direction == "stop":
             car.set_motor_model(0, 0, 0, 0)
             return
-        time.sleep(duration)
+
+        start_time = time.time()
+        while time.time() - start_time < duration:
+            time.sleep(0.01)  # timing
+
         car.set_motor_model(0, 0, 0, 0)
+        time.sleep(0.15)  # short pause between movementss
+
     except Exception as e:
         print(f"Motor control error: {e}")
+        car.set_motor_model(0, 0, 0, 0)
 
+
+# green object detection
+def detect_green_object():
+    """Continuously detect pale/lime green objects using Picamera2 + OpenCV"""
+    global object_detected, stop_detection
+
+    picam2 = Picamera2()
+    #configuration for low resolution. Good for limited hardware for smooth movement/detection.
+    config = picam2.create_preview_configuration(main={"size": (320, 240)})
+    picam2.configure(config)
+    picam2.start()
+    time.sleep(2)
+    print("Green object detection started")
+
+    while not stop_detection:
+        try:
+            frame = picam2.capture_array()
+            if frame is None:
+                continue
+
+            # Convert to HSV to accurately detect colors
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+            # Green color bounds for detection
+            lower_green = np.array([35, 40, 40])
+            upper_green = np.array([90, 255, 255])
+
+            mask = cv2.inRange(hsv, lower_green, upper_green)
+            green_pixels = cv2.countNonZero(mask)
+            total_pixels = mask.shape[0] * mask.shape[1]
+            green_percent = (green_pixels / total_pixels) * 100
+
+            if green_percent > 6:
+                if not object_detected:
+                    object_detected = True
+                    print("GREEN OBJECT DETECTED!")
+            else:
+                object_detected = False
+
+            time.sleep(0.1)
+
+        except Exception as e:
+            print(f"Camera error: {e}")
+            time.sleep(0.2)
+
+    picam2.stop()
+    print("Green detection stopped.")
+
+
+def start_detection():
+    """Run detection in background"""
+    global detection_thread, stop_detection
+    if detection_thread and detection_thread.is_alive():
+        print("Detection already running")
+        return
+    stop_detection = False
+    detection_thread = threading.Thread(target=detect_green_object, daemon=True)
+    detection_thread.start()
+
+
+def stop_detection_thread():
+    """Stop detection safely"""
+    global stop_detection
+    stop_detection = True
+
+
+# converts drawn path to coordinates
 def coordinates_to_moves(coords, pixels_per_second=100, min_distance=20):
-    """
-    Convert drawing coordinates to robot movements.
-    Filters out duplicate coordinates and tiny movements.
-    Robot starts facing UP (270 degrees in standard math coordinates).
-    """
+    """Convert drawn coordinates into smooth motor movements"""
     if len(coords) < 2:
         return []
 
-    # Filter out duplicate coordinates and tiny movements
-    filtered_coords = [coords[0]]  # Always keep first coordinate
-    
+    filtered = [coords[0]]
     for i in range(1, len(coords)):
-        x1, y1 = filtered_coords[-1]
+        x1, y1 = filtered[-1]
         x2, y2 = coords[i]
-        distance = math.sqrt((x2-x1)**2 + (y2-y1)**2)
-        
-        # Only keep coordinates that are significantly far apart
-        if distance >= min_distance:
-            filtered_coords.append(coords[i])
-    
-    print(f"Filtered from {len(coords)} to {len(filtered_coords)} coordinates")
-    print(f"Final coordinates: {filtered_coords}")
-    
-    if len(filtered_coords) < 2:
+        dist = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        if dist >= min_distance:
+            filtered.append(coords[i])
+
+    print(f"Simplified from {len(coords)} to {len(filtered)} points")
+    if len(filtered) < 2:
         return []
 
     moves = []
-    robot_angle = 270  # Robot starts facing UP on canvas
-    
-    for i in range(1, len(filtered_coords)):
-        x1, y1 = filtered_coords[i - 1]
-        x2, y2 = filtered_coords[i]
-        
-        # Calculate target direction using math
-        dx = x2 - x1
-        dy = y2 - y1
+    robot_angle = 270  # sets the robot to facing up initially
+
+    for i in range(1, len(filtered)):
+        x1, y1 = filtered[i - 1]
+        x2, y2 = filtered[i]
+        dx, dy = x2 - x1, y2 - y1
         target_angle = math.degrees(math.atan2(dy, dx))
-        
-        # Normalize to 0-360 range
-        while target_angle < 0:
-            target_angle += 360
-        while target_angle >= 360:
-            target_angle -= 360
-            
-        # Calculate turn needed
+        target_angle = (target_angle + 360) % 360
+
         angle_diff = target_angle - robot_angle
         if angle_diff > 180:
             angle_diff -= 360
         elif angle_diff < -180:
             angle_diff += 360
-            
-        print(f"Segment {i}: ({x1},{y1}) -> ({x2},{y2})")
-        print(f"  Robot at {robot_angle:.1f}°, target {target_angle:.1f}°, turn {angle_diff:.1f}°")
-        
-        # Turn if angle difference > 30 degrees
+
+        # turns only if necessary
         if abs(angle_diff) > 30:
-            # REVERSED: left becomes right, right becomes left
-            turn_direction = "right" if angle_diff > 0 else "left"
-            # INCREASED: Add 20 degrees to the turn angle for more complete turns
-            turn_angle = abs(angle_diff) + 20
-            turn_duration = turn_angle / 90 * 0.5  # 0.5 seconds per 90 degrees
-            print(f"  Turn {turn_direction} {turn_angle:.1f}° for {turn_duration:.2f}s")
-            moves.append((turn_direction, turn_duration))
+            turn_dir = "right" if angle_diff > 0 else "left"
+            turn_angle = abs(angle_diff) + 40
+            turn_dur = turn_angle / 90 * 0.5
+            print(f"Turn {turn_dir} {turn_angle:.1f}° ({turn_dur:.2f}s)")
+            moves.append((turn_dir, turn_dur))
             robot_angle = target_angle
-        
-        # Always drive forward to reach the next coordinate
-        distance = math.sqrt(dx*dx + dy*dy)
-        drive_duration = max(0.2, distance / pixels_per_second)  # Minimum 0.2s duration
-        print(f"  Drive forward {distance:.1f}px for {drive_duration:.2f}s")
-        moves.append(("forward", drive_duration))
-    
+
+        dist = math.sqrt(dx * dx + dy * dy)
+        dur = max(0.2, dist / pixels_per_second)
+        moves.append(("forward", dur))
+        print(f"Forward {dist:.1f}px ({dur:.2f}s)")
+
     return moves
 
-# --- Flask endpoints ---
+
+# flask routes
 @app.route("/path", methods=["POST"])
 def receive_path():
+    """Execute a drawn path"""
     try:
         data = request.json
-        if not data:
-            return jsonify({"message": "No data received"}), 400
+        if not data or "pathPoints" not in data:
+            return jsonify({"message": "No path data"}), 400
 
-        # Use real-time drawing coordinates if available
-        if "pathPoints" in data and data["pathPoints"]:
-            coords = data["pathPoints"]
-            print(f"Using real-time coordinates: {len(coords)} points")
-        else:
-            return jsonify({"message": "No path coordinates provided"}), 400
-
+        coords = data["pathPoints"]
         if len(coords) < 2:
-            return jsonify({"message": "Need at least 2 coordinates"}), 400
+            return jsonify({"message": "Not enough coordinates"}), 400
 
-        # Convert coordinates to robot moves
         moves = coordinates_to_moves(coords)
-        
-        if not moves:
-            return jsonify({"message": "No moves generated"}), 400
+        print(f"Executing {len(moves)} moves")
 
-        print(f"Executing {len(moves)} moves:")
-        
-        # Execute each move
         for i, (direction, duration) in enumerate(moves):
-            print(f"Move {i+1}/{len(moves)}: {direction} for {duration:.2f}s")
+            print(f"Move {i + 1}/{len(moves)}: {direction} ({duration:.2f}s)")
             move_car(direction, duration)
-            time.sleep(0.1)  # Small pause between moves
 
-        return jsonify({
-            "message": "Path executed successfully",
-            "moves_executed": len(moves),
-            "coordinates_processed": len(coords)
-        }), 200
-
+        return jsonify({"message": "Path executed successfully"}), 200
     except Exception as e:
-        print(f"Error processing path: {e}")
-        return jsonify({"message": "Error processing path", "error": str(e)}), 500
+        print(f"Path error: {e}")
+        return jsonify({"message": str(e)}), 500
+
+
+@app.route("/detection/start", methods=["POST"])
+def start_detection_route():
+    start_detection()
+    return jsonify({"message": "Detection started"}), 200
+
+
+@app.route("/detection/stop", methods=["POST"])
+def stop_detection_route():
+    stop_detection_thread()
+    return jsonify({"message": "Detection stopped"}), 200
+
+
+@app.route("/detection/status", methods=["GET"])
+def detection_status():
+    return jsonify({"object_detected": object_detected}), 200
+
 
 @app.route("/status", methods=["GET"])
 def get_status():
-    return jsonify({"status": "running", "motor_library": "freenove"}), 200
+    return jsonify(
+        {
+            "status": "running",
+            "motor_library": "freenove",
+            "object_detected": object_detected,
+        }
+    )
 
-# --- Run server ---
+
+# run flask server
 if __name__ == "__main__":
-    print("Starting robot path server")
+    print("Starting Flask server")
     try:
         app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
     except KeyboardInterrupt:
-        print("Server stopped")
+        print("Server stopped.")
     finally:
         cleanup_gpio()
